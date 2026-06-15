@@ -1,206 +1,420 @@
-import streamlit as st
-import random
-import json
-import os
-import re
 import base64
+import json
+import random
+import re
+from dataclasses import dataclass
 from datetime import date
+from pathlib import Path
 
-# ==========================================
-# 1. 内置题库 (按你的习惯，简答和问答分开编号)
-# ==========================================
-RAW_QUESTIONS = [
-    # ---- 简答题部分 ----
-    {"type": "简答", "num": 1, "question": "连续性介质假设"},
-    {"type": "简答", "num": 2, "question": "水力坡度、水头损失"},
-    {"type": "简答", "num": 3, "question": "弗劳德数Fr的物理意义"},
-    {"type": "简答", "num": 4, "question": "温度对流体和气体的动力粘度分别有什么影响？"},
-    {"type": "简答", "num": 5, "question": "水击现象是什么？"},
-    {"type": "简答", "num": 6, "question": "如何判别恒定/非恒定流，均匀/非均匀流？"},
-    {"type": "简答", "num": 7, "question": "减少水击的方法有哪些？"},
-    {"type": "简答", "num": 8, "question": "判断缓流急流的方式都有哪些？列举两种。"},
-    {"type": "简答", "num": 9, "question": "粘滞性的性质及雷诺数(Re)的性质。"},
-    {"type": "简答", "num": 10, "question": "明渠均匀流的产生条件与特点。"},
-    # 你可以继续添加简答题，num 顺延 11, 12...
-
-    # ---- 问答题部分 ----
-    {"type": "问答", "num": 1, "question": "水流进入阻力平方区，沿程摩擦系数怎么变？"},
-    {"type": "问答", "num": 2, "question": "矩形断面宽浅明渠水流为均匀流，若n变大，Q不变，Fr怎么变，为何？"},
-    {"type": "问答", "num": 3, "question": "尼古拉兹实验中沿程阻力系数怎么变化？"},
-    {"type": "问答", "num": 4, "question": "同样水头下，为何实用堰比宽顶堰的过水能力更强？"},
-    {"type": "问答", "num": 5, "question": "泄水建筑物下游常用何种水面衔接和消能措施？怎么确定水跃位置？"}
-    # 你可以继续添加问答题，num 顺延 6, 7...
-]
-
-# ==========================================
-# 2. 数据与文件匹配逻辑
-# ==========================================
-DATA_FILE = "review_progress.json"
-IMAGE_DIR = "images"
+import streamlit as st
 
 
-def load_data():
-    if os.path.exists(DATA_FILE):
-        with open(DATA_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    return {"mastered_ids": [], "check_ins": {}}
+APP_TITLE = "895 水力学复习打卡"
+DATA_FILE = Path("review_progress.json")
+IMAGE_DIR = Path("images")
+QUESTION_TYPES = ("简答", "问答")
 
 
-def save_data(data):
-    with open(DATA_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=4)
+@dataclass(frozen=True)
+class Question:
+    q_type: str
+    number: int
+    file_path: Path
+
+    @property
+    def qid(self) -> str:
+        return f"{self.q_type}_{self.number}"
+
+    @property
+    def title(self) -> str:
+        return f"{self.q_type}题 第 {self.number} 题"
+
+    @property
+    def prompt(self) -> str:
+        return f"请先独立回忆 {self.title} 的答案要点，再查看笔记核对。"
 
 
-# 核心升级：根据题型去对应的文件夹里找 PDF
-def find_file_for_question(q_type, q_num):
-    # 拼接出对应的子文件夹路径，例如 images/简答
-    type_dir = os.path.join(IMAGE_DIR, q_type)
+def load_data() -> dict:
+    if not DATA_FILE.exists():
+        return {"mastered_ids": [], "check_ins": {}}
 
-    if not os.path.exists(type_dir):
-        return None
+    try:
+        with DATA_FILE.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return {"mastered_ids": [], "check_ins": {}}
 
-    for filename in os.listdir(type_dir):
-        # 匹配 "1-3.pdf" 这种格式
-        range_match = re.match(r"(\d+)-(\d+)\.\w+", filename)
-        if range_match:
-            start = int(range_match.group(1))
-            end = int(range_match.group(2))
-            if start <= q_num <= end:
-                return os.path.join(type_dir, filename)
-
-        # 也兼容单独的 "1.pdf" 格式
-        single_match = re.match(r"(\d+)\.\w+", filename)
-        if single_match:
-            if int(single_match.group(1)) == q_num:
-                return os.path.join(type_dir, filename)
-
-    return None
+    return {
+        "mastered_ids": list(dict.fromkeys(data.get("mastered_ids", []))),
+        "check_ins": data.get("check_ins", {}),
+    }
 
 
-# ==========================================
-# 3. 初始化网页与会话状态
-# ==========================================
-st.set_page_config(page_title="895 水力学复习神器", page_icon="🌊", layout="centered")
+def save_data(data: dict) -> None:
+    with DATA_FILE.open("w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
 
-if "app_data" not in st.session_state:
-    st.session_state.app_data = load_data()
-if "current_batch" not in st.session_state:
+
+def parse_pdf_numbers(filename: str) -> list[int]:
+    match = re.fullmatch(r"(\d+)(?:-(\d+))?\.pdf", filename, flags=re.IGNORECASE)
+    if not match:
+        return []
+
+    start = int(match.group(1))
+    end = int(match.group(2) or start)
+    if end < start:
+        return []
+    return list(range(start, end + 1))
+
+
+@st.cache_data(show_spinner=False)
+def discover_questions() -> tuple[list[dict], dict[str, int]]:
+    questions: list[dict] = []
+    counts = {"简答": 0, "问答": 0, "pdf_files": 0}
+
+    for q_type in QUESTION_TYPES:
+        folder = IMAGE_DIR / q_type
+        if not folder.exists():
+            continue
+
+        for file_path in sorted(folder.glob("*.pdf"), key=lambda p: p.name):
+            numbers = parse_pdf_numbers(file_path.name)
+            if not numbers:
+                continue
+
+            counts[q_type] += len(numbers)
+            counts["pdf_files"] += 1
+            for number in numbers:
+                questions.append(
+                    {
+                        "q_type": q_type,
+                        "number": number,
+                        "file_path": str(file_path),
+                    }
+                )
+
+    questions.sort(key=lambda q: (q["q_type"], q["number"]))
+    return questions, counts
+
+
+def to_question(raw: dict) -> Question:
+    return Question(
+        q_type=raw["q_type"],
+        number=int(raw["number"]),
+        file_path=Path(raw["file_path"]),
+    )
+
+
+def init_session() -> None:
+    defaults = {
+        "app_data": load_data(),
+        "current_batch": [],
+        "batch_index": 0,
+        "show_answer": False,
+        "last_draw_types": list(QUESTION_TYPES),
+    }
+    for key, value in defaults.items():
+        st.session_state.setdefault(key, value)
+
+
+def reset_batch() -> None:
     st.session_state.current_batch = []
-if "batch_index" not in st.session_state:
     st.session_state.batch_index = 0
-if "show_answer" not in st.session_state:
     st.session_state.show_answer = False
 
-data = st.session_state.app_data
-mastered_ids = data["mastered_ids"]
-today_str = str(date.today())
 
-# ==========================================
-# 4. 侧边栏：控制台
-# ==========================================
-with st.sidebar:
-    st.header("⚙️ 学习控制台")
+def draw_batch(questions: list[dict], selected_types: list[str], draw_count: int) -> None:
+    mastered = set(st.session_state.app_data["mastered_ids"])
+    remaining = [
+        q
+        for q in questions
+        if q["q_type"] in selected_types and f"{q['q_type']}_{q['number']}" not in mastered
+    ]
 
-    total_q = len(RAW_QUESTIONS)
-    mastered_q = len(mastered_ids)
-    st.progress(mastered_q / total_q if total_q > 0 else 0)
-    st.write(f"**总进度:** {mastered_q} / {total_q} 题")
+    if not remaining:
+        reset_batch()
+        st.toast("当前筛选范围内没有待复习题目。")
+        return
 
-    st.markdown("---")
-    num_to_draw = st.slider("今天想复习多少题？", min_value=1, max_value=20, value=5)
+    draw_size = min(draw_count, len(remaining))
+    st.session_state.current_batch = random.sample(remaining, draw_size)
+    st.session_state.batch_index = 0
+    st.session_state.show_answer = False
 
-    if st.button("🎲 开始今日抽取", use_container_width=True):
-        # 使用 "类型_题号" 作为唯一标识，例如 "简答_1"
-        remaining = [q for q in RAW_QUESTIONS if f"{q['type']}_{q['num']}" not in mastered_ids]
-        if not remaining:
-            st.success("🎉 题库已全部掌握！")
-        else:
-            draw_size = min(num_to_draw, len(remaining))
-            st.session_state.current_batch = random.sample(remaining, draw_size)
-            st.session_state.batch_index = 0
-            st.session_state.show_answer = False
+
+def mark_mastered(question: Question) -> None:
+    data = st.session_state.app_data
+    if question.qid not in data["mastered_ids"]:
+        data["mastered_ids"].append(question.qid)
+
+    today = str(date.today())
+    data["check_ins"][today] = data["check_ins"].get(today, 0) + 1
+    save_data(data)
+
+
+def unmark_mastered(question: Question) -> None:
+    data = st.session_state.app_data
+    data["mastered_ids"] = [qid for qid in data["mastered_ids"] if qid != question.qid]
+    save_data(data)
+
+
+def render_pdf(file_path: Path) -> None:
+    if not file_path.exists():
+        st.warning(f"没有找到答案文件：{file_path}")
+        return
+
+    with file_path.open("rb") as f:
+        encoded_pdf = base64.b64encode(f.read()).decode("utf-8")
+
+    st.markdown(
+        f"""
+        <iframe
+            src="data:application/pdf;base64,{encoded_pdf}"
+            width="100%"
+            height="760"
+            style="border: 1px solid #d8dee9; border-radius: 8px; background: white;"
+            type="application/pdf">
+        </iframe>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def inject_css() -> None:
+    st.markdown(
+        """
+        <style>
+        .block-container {
+            padding-top: 1.8rem;
+            padding-bottom: 2.4rem;
+            max-width: 1180px;
+        }
+        section[data-testid="stSidebar"] {
+            background: #f7f9fc;
+            border-right: 1px solid #e6ebf2;
+        }
+        div[data-testid="stMetric"] {
+            background: #ffffff;
+            border: 1px solid #e6ebf2;
+            border-radius: 8px;
+            padding: 0.8rem 0.9rem;
+        }
+        .study-header {
+            padding: 0.2rem 0 1rem 0;
+            border-bottom: 1px solid #e6ebf2;
+            margin-bottom: 1.2rem;
+        }
+        .study-header h1 {
+            font-size: 2rem;
+            margin: 0;
+            letter-spacing: 0;
+        }
+        .study-subtitle {
+            color: #526070;
+            margin-top: 0.35rem;
+        }
+        .question-card {
+            border: 1px solid #dfe6ee;
+            border-radius: 8px;
+            padding: 1.15rem 1.25rem;
+            background: #ffffff;
+            margin: 0.75rem 0 1rem 0;
+        }
+        .question-kicker {
+            color: #4d6277;
+            font-size: 0.95rem;
+            margin-bottom: 0.35rem;
+        }
+        .question-title {
+            font-size: 1.65rem;
+            font-weight: 720;
+            color: #17212b;
+            margin-bottom: 0.45rem;
+        }
+        .question-prompt {
+            color: #384858;
+            font-size: 1.02rem;
+            line-height: 1.65;
+        }
+        .answer-note {
+            background: #f4f8fb;
+            border: 1px solid #dce7f0;
+            border-radius: 8px;
+            padding: 0.75rem 0.9rem;
+            color: #34495e;
+            margin-bottom: 0.75rem;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def render_sidebar(questions: list[dict], counts: dict[str, int]) -> None:
+    data = st.session_state.app_data
+    mastered_ids = set(data["mastered_ids"])
+    total_questions = len(questions)
+    mastered_count = len([q for q in questions if f"{q['q_type']}_{q['number']}" in mastered_ids])
+    today_done = data["check_ins"].get(str(date.today()), 0)
+
+    with st.sidebar:
+        st.header("学习控制台")
+        st.progress(mastered_count / total_questions if total_questions else 0)
+
+        c1, c2 = st.columns(2)
+        c1.metric("已掌握", mastered_count)
+        c2.metric("总题数", total_questions)
+        st.metric("今日完成", today_done)
+
+        st.caption(f"已识别 PDF：{counts.get('pdf_files', 0)} 个")
+        st.caption(f"简答题：{counts.get('简答', 0)} 题 · 问答题：{counts.get('问答', 0)} 题")
+        st.divider()
+
+        selected_types = st.multiselect(
+            "题型",
+            options=list(QUESTION_TYPES),
+            default=st.session_state.last_draw_types,
+            help="可以只抽简答或只抽问答。",
+        )
+        if not selected_types:
+            selected_types = list(QUESTION_TYPES)
+
+        max_draw = max(1, min(30, total_questions or 1))
+        draw_count = st.slider("本轮抽题数量", min_value=1, max_value=max_draw, value=min(10, max_draw))
+
+        if st.button("开始随机抽题", type="primary", use_container_width=True):
+            st.session_state.last_draw_types = selected_types
+            draw_batch(questions, selected_types, draw_count)
             st.rerun()
 
-    st.markdown("---")
-    st.header("📅 打卡记录")
-    if data["check_ins"]:
-        for date_key, count in sorted(data["check_ins"].items(), reverse=True)[:5]:
-            st.write(f"✅ {date_key}: 完成 {count} 题")
-    else:
-        st.write("暂无记录，今天开始加油！")
+        if st.button("清空本轮", use_container_width=True):
+            reset_batch()
+            st.rerun()
 
-    st.markdown("---")
-    if st.button("⚠️ 重置所有进度"):
-        st.session_state.app_data = {"mastered_ids": [], "check_ins": data["check_ins"]}
-        save_data(st.session_state.app_data)
-        st.session_state.current_batch = []
+        st.divider()
+        st.subheader("最近打卡")
+        recent = sorted(data["check_ins"].items(), reverse=True)[:7]
+        if recent:
+            for day, count in recent:
+                st.write(f"{day}：完成 {count} 题")
+        else:
+            st.caption("还没有打卡记录。")
+
+        st.divider()
+        if st.button("重置已掌握进度", use_container_width=True):
+            st.session_state.app_data = {"mastered_ids": [], "check_ins": data["check_ins"]}
+            save_data(st.session_state.app_data)
+            reset_batch()
+            st.rerun()
+
+
+def render_empty_state(questions: list[dict]) -> None:
+    if not questions:
+        st.error("没有识别到题库 PDF。请确认 `images/简答` 和 `images/问答` 中有 PDF 文件。")
+        return
+
+    st.info("在左侧选择题型和数量，然后点击“开始随机抽题”。")
+
+    col1, col2, col3 = st.columns(3)
+    col1.metric("复习方式", "随机抽题")
+    col2.metric("答案来源", "PDF 笔记")
+    col3.metric("掌握规则", "掌握后不再抽")
+
+
+def render_question_workspace() -> None:
+    batch = st.session_state.current_batch
+    if not batch:
+        return
+
+    index = min(st.session_state.batch_index, len(batch) - 1)
+    st.session_state.batch_index = index
+    question = to_question(batch[index])
+    mastered = question.qid in set(st.session_state.app_data["mastered_ids"])
+
+    st.caption(f"本轮进度：第 {index + 1} / {len(batch)} 题")
+    st.progress((index + 1) / len(batch))
+
+    st.markdown(
+        f"""
+        <div class="question-card">
+            <div class="question-kicker">{question.q_type} · PDF：{question.file_path.name}</div>
+            <div class="question-title">{question.title}</div>
+            <div class="question-prompt">{question.prompt}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    nav1, nav2, nav3, nav4 = st.columns([1, 1, 1.2, 1.4])
+    if nav1.button("上一题", use_container_width=True, disabled=index == 0):
+        st.session_state.batch_index -= 1
+        st.session_state.show_answer = False
+        st.rerun()
+    if nav2.button("下一题", use_container_width=True, disabled=index >= len(batch) - 1):
+        st.session_state.batch_index += 1
+        st.session_state.show_answer = False
+        st.rerun()
+    if nav3.button("显示/隐藏答案", use_container_width=True):
+        st.session_state.show_answer = not st.session_state.show_answer
+        st.rerun()
+    if nav4.button("标记已掌握", type="primary", use_container_width=True, disabled=mastered):
+        mark_mastered(question)
+        if index < len(batch) - 1:
+            st.session_state.batch_index += 1
+        st.session_state.show_answer = False
         st.rerun()
 
-# ==========================================
-# 5. 主区域：刷题与 PDF 预览
-# ==========================================
-st.title("🌊 895 专属复习打卡系统")
+    aux1, aux2 = st.columns([1, 1])
+    if aux1.button("暂时跳过", use_container_width=True):
+        if index < len(batch) - 1:
+            st.session_state.batch_index += 1
+        st.session_state.show_answer = False
+        st.rerun()
+    if aux2.button("撤销本题已掌握", use_container_width=True, disabled=not mastered):
+        unmark_mastered(question)
+        st.rerun()
 
-if not st.session_state.current_batch:
-    st.info("👈 请在左侧设定题量并点击【开始今日抽取】")
-else:
-    batch = st.session_state.current_batch
-    idx = st.session_state.batch_index
+    if mastered:
+        st.success("这道题已在你的掌握列表中。")
 
-    if idx < len(batch):
-        current_q = batch[idx]
-        # 生成唯一标识，如 "简答_1"
-        unique_id = f"{current_q['type']}_{current_q['num']}"
+    if st.session_state.show_answer:
+        st.markdown(
+            f"""
+            <div class="answer-note">
+                已打开答案笔记：<strong>{question.file_path.as_posix()}</strong>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        render_pdf(question.file_path)
 
-        st.caption(f"当前进度：第 {idx + 1} 题 / 共 {len(batch)} 题")
+    if index == len(batch) - 1:
+        st.caption("已经到本轮最后一题。可以继续标记掌握，或从左侧重新抽一轮。")
 
-        st.markdown(f"### 【{current_q['type']}】第 {current_q['num']} 题")
-        st.markdown(f"## {current_q['question']}")
 
-        # 核心：同时传入题型和题号去找文件
-        file_path = find_file_for_question(current_q['type'], current_q['num'])
+def main() -> None:
+    st.set_page_config(page_title=APP_TITLE, page_icon="📘", layout="wide")
+    inject_css()
+    init_session()
 
-        if st.button("👁️ 查看我的笔记答案", use_container_width=True):
-            st.session_state.show_answer = not st.session_state.show_answer
+    questions, counts = discover_questions()
+    render_sidebar(questions, counts)
 
-        if st.session_state.show_answer:
-            if file_path:
-                ext = file_path.split('.')[-1].lower()
-                st.caption(f"已自动匹配到文件: {current_q['type']} / {os.path.basename(file_path)}")
+    st.markdown(
+        """
+        <div class="study-header">
+            <h1>895 水力学复习打卡</h1>
+            <div class="study-subtitle">随机抽题、按需查看 PDF 笔记、记录已掌握题目。</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
-                if ext == 'pdf':
-                    with open(file_path, "rb") as f:
-                        base64_pdf = base64.b64encode(f.read()).decode('utf-8')
-                    pdf_display = f'<iframe src="data:application/pdf;base64,{base64_pdf}" width="100%" height="500px" type="application/pdf"></iframe>'
-                    st.markdown(pdf_display, unsafe_allow_html=True)
-                else:
-                    st.image(file_path, use_container_width=True)
-            else:
-                st.warning(f"⚠️ 找不到对应的笔记。请检查是否将文件放入了 images/{current_q['type']} 文件夹中。")
-
-        st.markdown("---")
-
-        col1, col2 = st.columns(2)
-        with col1:
-            if st.button("⏭️ 暂时跳过 (下次再背)", use_container_width=True):
-                st.session_state.batch_index += 1
-                st.session_state.show_answer = False
-                st.rerun()
-        with col2:
-            if st.button("✅ 我已掌握，不再出现", type="primary", use_container_width=True):
-                mastered_ids.append(unique_id)
-                if today_str not in data["check_ins"]:
-                    data["check_ins"][today_str] = 0
-                data["check_ins"][today_str] += 1
-                save_data(st.session_state.app_data)
-
-                st.session_state.batch_index += 1
-                st.session_state.show_answer = False
-                st.rerun()
+    if st.session_state.current_batch:
+        render_question_workspace()
     else:
-        st.success("🎯 恭喜！今天抽取的题目已经全部过完啦！")
-        st.balloons()
-        if st.button("完成并返回"):
-            st.session_state.current_batch = []
-            st.session_state.batch_index = 0
-            st.rerun()
+        render_empty_state(questions)
+
+
+if __name__ == "__main__":
+    main()
