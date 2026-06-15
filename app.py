@@ -3,14 +3,25 @@ import json
 import random
 import re
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import streamlit as st
 
+try:
+    import extra_streamlit_components as stx
+except ImportError:  # pragma: no cover - handled in the UI for missing installs.
+    stx = None
+
+try:
+    import fitz
+except ImportError:  # pragma: no cover - handled in the UI for missing installs.
+    fitz = None
+
 
 APP_TITLE = "895 水力学复习打卡"
-DATA_FILE = Path("review_progress.json")
+COOKIE_NAME = "895_hydraulics_review_progress_v2"
+QUESTIONS_FILE = Path("questions.json")
 IMAGE_DIR = Path("images")
 QUESTION_TYPES = ("简答", "问答")
 
@@ -20,6 +31,7 @@ class Question:
     q_type: str
     number: int
     file_path: Path
+    prompt_text: str = ""
 
     @property
     def qid(self) -> str:
@@ -31,28 +43,98 @@ class Question:
 
     @property
     def prompt(self) -> str:
-        return f"请先独立回忆 {self.title} 的答案要点，再查看笔记核对。"
+        if self.prompt_text.strip():
+            return self.prompt_text.strip()
+        return (
+            f"这道题还没有录入文字题干。请在 questions.json 中补充 {self.qid}，"
+            "当前可先按题号复习，并点击“显示/隐藏答案”查看下方 PDF 图片。"
+        )
 
 
-def load_data() -> dict:
-    if not DATA_FILE.exists():
-        return {"mastered_ids": [], "check_ins": {}}
+def empty_progress() -> dict:
+    return {"mastered_ids": [], "check_ins": {}}
 
-    try:
-        with DATA_FILE.open("r", encoding="utf-8") as f:
-            data = json.load(f)
-    except (json.JSONDecodeError, OSError):
-        return {"mastered_ids": [], "check_ins": {}}
+
+def normalize_progress(data: object) -> dict:
+    if not isinstance(data, dict):
+        return empty_progress()
+
+    mastered_ids = data.get("mastered_ids", [])
+    if not isinstance(mastered_ids, list):
+        mastered_ids = []
+
+    check_ins = data.get("check_ins", {})
+    if not isinstance(check_ins, dict):
+        check_ins = {}
 
     return {
-        "mastered_ids": list(dict.fromkeys(data.get("mastered_ids", []))),
-        "check_ins": data.get("check_ins", {}),
+        "mastered_ids": list(dict.fromkeys(str(item) for item in mastered_ids)),
+        "check_ins": {str(day): int(count) for day, count in check_ins.items() if str(count).isdigit()},
     }
 
 
+def encode_progress_cookie(data: dict) -> str:
+    payload = json.dumps(normalize_progress(data), ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    return base64.urlsafe_b64encode(payload).decode("ascii")
+
+
+def decode_progress_cookie(raw_value: object) -> dict:
+    if not isinstance(raw_value, str) or not raw_value:
+        return empty_progress()
+
+    try:
+        padded = raw_value + "=" * (-len(raw_value) % 4)
+        payload = base64.urlsafe_b64decode(padded.encode("ascii")).decode("utf-8")
+        return normalize_progress(json.loads(payload))
+    except (ValueError, json.JSONDecodeError, UnicodeDecodeError):
+        return empty_progress()
+
+
+def get_cookie_manager():
+    if stx is None:
+        return None
+    return stx.CookieManager()
+
+
+def load_data(cookie_manager=None) -> dict:
+    if cookie_manager is None:
+        return empty_progress()
+    try:
+        return decode_progress_cookie(cookie_manager.get(COOKIE_NAME))
+    except Exception:
+        return empty_progress()
+
+
 def save_data(data: dict) -> None:
-    with DATA_FILE.open("w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+    normalized = normalize_progress(data)
+    st.session_state.app_data = normalized
+
+    cookie_manager = st.session_state.get("cookie_manager")
+    if cookie_manager is None:
+        return
+
+    cookie_manager.set(
+        COOKIE_NAME,
+        encode_progress_cookie(normalized),
+        expires_at=datetime.now() + timedelta(days=365),
+        same_site="strict",
+    )
+
+
+def load_question_prompts(path: Path = QUESTIONS_FILE) -> dict[str, str]:
+    if not path.exists():
+        return {}
+
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+    if not isinstance(data, dict):
+        return {}
+
+    return {str(key): str(value).strip() for key, value in data.items() if str(value).strip()}
 
 
 def parse_pdf_numbers(filename: str) -> list[int]:
@@ -97,24 +179,46 @@ def discover_questions() -> tuple[list[dict], dict[str, int]]:
     return questions, counts
 
 
+def apply_prompts(questions: list[dict], prompts: dict[str, str]) -> list[dict]:
+    enriched = []
+    for question in questions:
+        qid = f"{question['q_type']}_{question['number']}"
+        enriched.append({**question, "prompt_text": prompts.get(qid, "")})
+    return enriched
+
+
 def to_question(raw: dict) -> Question:
     return Question(
         q_type=raw["q_type"],
         number=int(raw["number"]),
         file_path=Path(raw["file_path"]),
+        prompt_text=raw.get("prompt_text", ""),
     )
 
 
-def init_session() -> None:
-    defaults = {
-        "app_data": load_data(),
-        "current_batch": [],
-        "batch_index": 0,
-        "show_answer": False,
-        "last_draw_types": list(QUESTION_TYPES),
-    }
-    for key, value in defaults.items():
-        st.session_state.setdefault(key, value)
+@st.cache_data(show_spinner=False)
+def pdf_page_images(file_path: str, zoom: float = 1.75, max_pages: int = 8) -> tuple[list[bytes], int]:
+    if fitz is None:
+        raise RuntimeError("PyMuPDF is not installed")
+
+    images: list[bytes] = []
+    with fitz.open(file_path) as doc:
+        total_pages = len(doc)
+        matrix = fitz.Matrix(zoom, zoom)
+        for page_index in range(min(total_pages, max_pages)):
+            pixmap = doc[page_index].get_pixmap(matrix=matrix, alpha=False)
+            images.append(pixmap.tobytes("png"))
+    return images, total_pages
+
+
+def init_session(cookie_manager) -> None:
+    st.session_state.setdefault("cookie_manager", cookie_manager)
+    if "app_data" not in st.session_state:
+        st.session_state.app_data = load_data(cookie_manager)
+    st.session_state.setdefault("current_batch", [])
+    st.session_state.setdefault("batch_index", 0)
+    st.session_state.setdefault("show_answer", False)
+    st.session_state.setdefault("last_draw_types", list(QUESTION_TYPES))
 
 
 def reset_batch() -> None:
@@ -164,20 +268,35 @@ def render_pdf(file_path: Path) -> None:
         return
 
     with file_path.open("rb") as f:
-        encoded_pdf = base64.b64encode(f.read()).decode("utf-8")
+        pdf_bytes = f.read()
 
-    st.markdown(
-        f"""
-        <iframe
-            src="data:application/pdf;base64,{encoded_pdf}"
-            width="100%"
-            height="760"
-            style="border: 1px solid #d8dee9; border-radius: 8px; background: white;"
-            type="application/pdf">
-        </iframe>
-        """,
-        unsafe_allow_html=True,
+    st.download_button(
+        "下载原始 PDF",
+        data=pdf_bytes,
+        file_name=file_path.name,
+        mime="application/pdf",
+        use_container_width=True,
     )
+
+    if fitz is None:
+        st.error("当前环境没有安装 PyMuPDF，无法把 PDF 渲染为图片。请确认 requirements.txt 中包含 PyMuPDF。")
+        return
+
+    try:
+        images, total_pages = pdf_page_images(str(file_path))
+    except Exception as exc:
+        st.error(f"PDF 转图片失败：{exc}")
+        return
+
+    if not images:
+        st.warning("这个 PDF 没有可显示的页面。")
+        return
+
+    if total_pages > len(images):
+        st.info(f"该 PDF 共 {total_pages} 页，当前显示前 {len(images)} 页。")
+
+    for index, image in enumerate(images, start=1):
+        st.image(image, caption=f"{file_path.name} 第 {index} 页", use_container_width=True)
 
 
 def inject_css() -> None:
@@ -192,6 +311,9 @@ def inject_css() -> None:
         section[data-testid="stSidebar"] {
             background: #f7f9fc;
             border-right: 1px solid #e6ebf2;
+        }
+        section[data-testid="stSidebar"] * {
+            color: #17212b;
         }
         div[data-testid="stMetric"] {
             background: #ffffff;
@@ -210,7 +332,7 @@ def inject_css() -> None:
             letter-spacing: 0;
         }
         .study-subtitle {
-            color: #526070;
+            color: #d4d9e2;
             margin-top: 0.35rem;
         }
         .question-card {
@@ -233,8 +355,8 @@ def inject_css() -> None:
         }
         .question-prompt {
             color: #384858;
-            font-size: 1.02rem;
-            line-height: 1.65;
+            font-size: 1.08rem;
+            line-height: 1.7;
         }
         .answer-note {
             background: #f4f8fb;
@@ -268,6 +390,11 @@ def render_sidebar(questions: list[dict], counts: dict[str, int]) -> None:
 
         st.caption(f"已识别 PDF：{counts.get('pdf_files', 0)} 个")
         st.caption(f"简答题：{counts.get('简答', 0)} 题 · 问答题：{counts.get('问答', 0)} 题")
+
+        with st.expander("在线与个人数据说明", expanded=True):
+            st.write("当前 `localhost` 是你电脑上的本地预览。部署到 Streamlit Cloud 后，别人才能通过网址访问。")
+            st.write("每个人的掌握进度保存在自己浏览器的 Cookie 中，不会写入服务器公共 JSON。")
+
         st.divider()
 
         selected_types = st.multiselect(
@@ -301,14 +428,13 @@ def render_sidebar(questions: list[dict], counts: dict[str, int]) -> None:
             st.caption("还没有打卡记录。")
 
         st.divider()
-        if st.button("重置已掌握进度", use_container_width=True):
-            st.session_state.app_data = {"mastered_ids": [], "check_ins": data["check_ins"]}
-            save_data(st.session_state.app_data)
+        if st.button("重置本浏览器进度", use_container_width=True):
+            save_data(empty_progress())
             reset_batch()
             st.rerun()
 
 
-def render_empty_state(questions: list[dict]) -> None:
+def render_empty_state(questions: list[dict], prompt_count: int) -> None:
     if not questions:
         st.error("没有识别到题库 PDF。请确认 `images/简答` 和 `images/问答` 中有 PDF 文件。")
         return
@@ -317,8 +443,12 @@ def render_empty_state(questions: list[dict]) -> None:
 
     col1, col2, col3 = st.columns(3)
     col1.metric("复习方式", "随机抽题")
-    col2.metric("答案来源", "PDF 笔记")
-    col3.metric("掌握规则", "掌握后不再抽")
+    col2.metric("PDF 显示", "图片预览")
+    col3.metric("已录题干", f"{prompt_count} 条")
+
+    if st.button("开始一轮复习", type="primary", use_container_width=True):
+        draw_batch(questions, list(QUESTION_TYPES), 10)
+        st.rerun()
 
 
 def render_question_workspace() -> None:
@@ -395,16 +525,21 @@ def render_question_workspace() -> None:
 def main() -> None:
     st.set_page_config(page_title=APP_TITLE, page_icon="📘", layout="wide")
     inject_css()
-    init_session()
 
-    questions, counts = discover_questions()
+    cookie_manager = get_cookie_manager()
+    init_session(cookie_manager)
+
+    prompts = load_question_prompts()
+    raw_questions, counts = discover_questions()
+    questions = apply_prompts(raw_questions, prompts)
+
     render_sidebar(questions, counts)
 
     st.markdown(
         """
         <div class="study-header">
             <h1>895 水力学复习打卡</h1>
-            <div class="study-subtitle">随机抽题、按需查看 PDF 笔记、记录已掌握题目。</div>
+            <div class="study-subtitle">随机抽题、按需查看 PDF 图片笔记、每个浏览器单独保存掌握进度。</div>
         </div>
         """,
         unsafe_allow_html=True,
@@ -413,7 +548,7 @@ def main() -> None:
     if st.session_state.current_batch:
         render_question_workspace()
     else:
-        render_empty_state(questions)
+        render_empty_state(questions, len(prompts))
 
 
 if __name__ == "__main__":
