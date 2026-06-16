@@ -392,7 +392,7 @@ def render_sidebar(questions: list[dict], counts: dict[str, int]) -> None:
         st.caption(f"简答题：{counts.get('简答', 0)} 题 · 问答题：{counts.get('问答', 0)} 题")
 
         with st.expander("在线与个人数据说明", expanded=True):
-            st.write("当前 `localhost` 是你电脑上的本地预览。部署到 Streamlit Cloud 后，别人才能通过网址访问。")
+            st.write("如果浏览器地址是 `localhost`，那只是你电脑上的本地预览；`.streamlit.app` 地址才是可以分享给别人的在线网页。")
             st.write("每个人的掌握进度保存在自己浏览器的 Cookie 中，不会写入服务器公共 JSON。")
 
         st.divider()
