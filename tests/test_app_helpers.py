@@ -37,6 +37,21 @@ class AppHelperTests(unittest.TestCase):
         self.assertEqual(app.parse_pdf_numbers("9-7.pdf"), [])
         self.assertEqual(app.parse_pdf_numbers("abc.pdf"), [])
 
+    def test_all_discovered_questions_have_prompts(self):
+        questions, counts = app.discover_questions()
+        prompts = app.load_question_prompts()
+
+        expected_count = counts["简答"] + counts["问答"]
+        missing = [
+            f"{question['q_type']}_{question['number']}"
+            for question in questions
+            if not prompts.get(f"{question['q_type']}_{question['number']}")
+        ]
+
+        self.assertEqual(len(questions), expected_count)
+        self.assertEqual(len(prompts), expected_count)
+        self.assertEqual(missing, [])
+
 
 if __name__ == "__main__":
     unittest.main()
